@@ -1,17 +1,12 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
-sbatch*
-scripts/
-slurms/
-**/__pycache__/
+*qzl
+data/textquests
+# C extensions
 *.so
-scripts/
-logs/
 
-*/__pycache__/
-*results*/
-sb-cli*/
 # Distribution / packaging
 .Python
 build/
@@ -32,6 +27,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+__pycache__
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -199,7 +195,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-
+*qzl
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
@@ -211,7 +207,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-# Large result files
-*.json
+
+
 results/
-tmp/
+# TextQuests specific
+data/textquests/
+textquests_data.zip

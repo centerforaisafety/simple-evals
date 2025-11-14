@@ -1,17 +1,15 @@
+# Machiavelli game data (downloaded from HuggingFace)
+game_data/
+game_data.zip
+
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
-sbatch*
-scripts/
-slurms/
-**/__pycache__/
-*.so
-scripts/
-logs/
 
-*/__pycache__/
-*results*/
-sb-cli*/
+# C extensions
+*.so
+
 # Distribution / packaging
 .Python
 build/
@@ -32,6 +30,8 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+results*
+results/
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -211,7 +211,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-# Large result files
-*.json
-results/
-tmp/

@@ -1,0 +1,81 @@
+grok-4:
+  model: xai/grok-4
+
+grok-4-fast-reasoning:
+  model: xai/grok-4-fast-reasoning
+
+claude-sonnet-4-5:
+  model: anthropic/claude-sonnet-4-5
+  generation_config:
+    max_tokens: 40000
+    use_cache: true # this is for prompt caching on long context evals
+    vertexai: true
+    thinking:
+      type: enabled
+      budget_tokens: 32000
+
+claude-haiku-4-5:
+  model: anthropic/claude-haiku-4-5
+  generation_config:
+    max_tokens: 40000
+    use_cache: true # this is for prompt caching on long context evals
+    vertexai: true
+    thinking:
+      type: enabled
+      budget_tokens: 32000
+
+gpt-5:
+  model: openai/gpt-5
+  generation_config:
+    reasoning_effort: high
+
+gpt-5-mini:
+  model: openai/gpt-5-mini
+  generation_config:
+    reasoning_effort: high
+
+gpt-5-nano:
+  model: openai/gpt-5-nano
+  generation_config:
+    reasoning_effort: high
+
+gemini-2.5-pro:
+  model: gemini/gemini-2.5-pro
+  generation_config:
+    reasoning_effort: high
+
+gemini-2.5-flash:
+  model: gemini/gemini-2.5-flash
+  generation_config:
+    reasoning_effort: high
+
+gemini-2.5-flash-lite:
+  model: gemini/gemini-2.5-flash-lite
+  generation_config:
+    reasoning_effort: high
+
+qwen3-max-thinking:
+  model: openai/qwen3-max-preview
+  generation_config:
+    api_key_env: DASHSCOPE_API_KEY
+    api_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    extra_body:
+      enable_thinking: true
+
+deepseek-v3.2-exp:
+  model: openai/deepseek-reasoner
+  generation_config:
+    api_key_env: DEEPSEEK_API_KEY
+    api_base_url: https://api.deepseek.com
+
+kimi-k2:
+  model: openai/kimi-k2-thinking
+  generation_config:
+    api_key_env: MOONSHOT_API_KEY
+    api_base_url: https://api.moonshot.ai/v1
+
+glm-4.6:
+  model: openai/glm-4.6
+  generation_config:
+    api_key_env: ZAI_API_KEY
+    api_base_url: https://api.z.ai/api/paas/v4/
