@@ -129,6 +129,7 @@ python -m <benchmark>.<script> \
   --model <model_name> \
   --output_file <path> \
   --models_config configs/models.yaml
+  --max_concurrent N
 ```
 
 ---
