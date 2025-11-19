@@ -172,10 +172,21 @@ async def generate_predictions(agent,
     tasks = [predict_with_semaphore(example, idx) for idx, example in enumerate(examples)]
     
     results = []
-    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Generating predictions"):
+    correct = 0
+    pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Evaluating")
+    for task in pbar:
         result = await task
         if result:
             results.append(result)
+            correct += int(result['is_correct'])
+            
+            # Update progress bar with accuracy and cost
+            accuracy = 100 * correct / len(results)
+            cost = agent.all_token_usage.cost
+            pbar.set_postfix({
+                "acc": f"{accuracy:.1f}%",
+                "cost": f"${cost:.3f}"
+            })
     
     return results
 

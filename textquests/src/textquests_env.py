@@ -31,8 +31,6 @@ class TextQuestsEnv():
 
         self.with_clues = with_clues
 
-        print('Loading game {}.'.format(self.game_name))
-
         # ================= LOADING GAME ================= #
         zcode_path = None
         for i in range(6):
@@ -95,7 +93,6 @@ class TextQuestsEnv():
         # ================= LOADING REPLACEMENT DICT ================= #
         self.compressed_games = ['trinity', 'ballyhoo']  # add compressed games to this list
         if self.game_name in self.compressed_games:
-            print('Using replacement dict.\n')
             assert os.path.exists(os.path.join(game_folder_path, 'replacement_dict.csv')), 'Could not find replacement_dict.csv'
             replacement_dict_path = os.path.join(game_folder_path, 'replacement_dict.csv')
             replacement_dict = {}
@@ -121,24 +118,19 @@ class TextQuestsEnv():
         feelies_path = os.path.join(game_folder_path, 'feelies/feelies_text.txt')
         invisiclues_path = os.path.join(game_folder_path, 'feelies/invisiclues.txt')
 
+        # Load invisiclues (puzzle hints) - only used if with_clues=True
         if os.path.exists(invisiclues_path):
             with open(invisiclues_path, 'r') as f:
                 self.invisiclues = f.read()
         else:
             self.invisiclues = ""
         
+        # Load feelies (guidelines/background story) - always used
         if os.path.exists(feelies_path):
             with open(feelies_path, 'r', errors='replace') as f:
-                self.feelies_text = f.read()
+                self.guidelines = f.read()
         else:
-            self.feelies_text = ""
-
-        feelies = ""
-        if self.invisiclues and self.with_clues:
-            feelies += f"=====[Invisiclues]=====\n{self.invisiclues}\n"
-        if self.feelies_text:
-            feelies += f"=====[Feelies]=====\n{self.feelies_text}\n"
-        self.feelies = feelies
+            self.guidelines = ""
 
         if seed: self.seed(seed)
         self.reset()
@@ -161,7 +153,7 @@ class TextQuestsEnv():
         Parses text of the form "...[RWD_ID: verbs:347, VAL: 5]...", and removes the
         reward labels from the observation.
         """
-        parse = re.findall('\[RWD_ID: ([^:]*?:[0-9]*), VAL:(.*?)\]', observation)
+        parse = re.findall(r'\[RWD_ID: ([^:]*?:[0-9]*), VAL:(.*?)\]', observation)
         reward = 0
         for x in parse:
             if x[0] in self.state['reward_ids_seen']:
@@ -169,7 +161,7 @@ class TextQuestsEnv():
             self.state['reward_ids_seen'].append(x[0])
             reward += int(x[1])
 
-        observation = re.sub('\[RWD_ID: [^:]*?:[0-9]*, VAL:.*?\]', '', observation)
+        observation = re.sub(r'\[RWD_ID: [^:]*?:[0-9]*, VAL:.*?\]', '', observation)
 
         return observation, reward
 
@@ -371,9 +363,9 @@ class TextQuestsEnv():
 
     def _parse_game_over(self, observation):
         found_game_over = False
-        parse = re.findall('\[EVENT: GAME OVER\]', observation)
+        parse = re.findall(r'\[EVENT: GAME OVER\]', observation)
         if len(parse) > 0:
-            observation = re.sub('\[EVENT: GAME OVER\]', '', observation)
+            observation = re.sub(r'\[EVENT: GAME OVER\]', '', observation)
             found_game_over = True
 
         return observation, found_game_over
@@ -400,13 +392,13 @@ class TextQuestsEnv():
 
     def _find_markers(self, observation):
         # parse out markers and remove from observation
-        markers_type1 = re.findall('\[ID: ([^:]*?:[0-9]*(?:\([a-z]\))?), PRSO: (.*?), PRSI: (.*?)\]', observation)
-        markers_type2 = re.findall('\[ID: ([^:]*?:[0-9]*(?:\([a-z]\))?)\]', observation)
+        markers_type1 = re.findall(r'\[ID: ([^:]*?:[0-9]*(?:\([a-z]\))?), PRSO: (.*?), PRSI: (.*?)\]', observation)
+        markers_type2 = re.findall(r'\[ID: ([^:]*?:[0-9]*(?:\([a-z]\))?)\]', observation)
         markers_type2 = [(tmp,) for tmp in markers_type2] # put each marker in singleton tuple for consistency with type1
         markers = markers_type1 + markers_type2
 
-        observation = re.sub('\[ID: [^:]*?:[0-9]*(?:\([a-z]\))?, PRSO: .*?, PRSI: .*?\]', '', observation)
-        observation = re.sub('\[ID: [^:]*?:[0-9]*(?:\([a-z]\))?\]', '', observation)
+        observation = re.sub(r'\[ID: [^:]*?:[0-9]*(?:\([a-z]\))?, PRSO: .*?, PRSI: .*?\]', '', observation)
+        observation = re.sub(r'\[ID: [^:]*?:[0-9]*(?:\([a-z]\))?\]', '', observation)
 
         # increment count for marker in annotation_dict
         for marker in markers:
@@ -491,7 +483,7 @@ class TextQuestsEnv():
                 saved_state = self.get_state()
                 look, _, _, _ = self._pre_step('look')
                 self.set_state(saved_state)
-            score_parse = re.findall('.*Score: (.*?)\s.*Moves: (.*?)\s', look)
+            score_parse = re.findall(r'.*Score: (.*?)\s.*Moves: (.*?)\s', look)
             if len(score_parse) > 0:
                 score, moves = score_parse[0]
                 if (len(score_parse) > 1) and (self.game_name in ['stationfall']) and (score_inp is not None):
@@ -511,7 +503,7 @@ class TextQuestsEnv():
         elif self.game_name == 'wishbringer':
             score, moves = self._score_parsing_helper('Your score is (.*?) point[s]? out of', score_inp=score_inp)
         elif self.game_name == 'trinity':
-            score, moves = self._score_parsing_helper('\[Your score is (.*) point[s]? out of', score_inp=score_inp)
+            score, moves = self._score_parsing_helper(r'\[Your score is (.*) point[s]? out of', score_inp=score_inp)
         elif self.game_name == 'sherlock':
             score, moves = self._score_parsing_helper('([0-9]*) out of 100', score_inp=score_inp)
         elif self.game_name in self.custom_reward_games:  # games with custom rewards
