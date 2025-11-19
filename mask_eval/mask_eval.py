@@ -605,10 +605,19 @@ def main():
         raise ValueError(f"Model {args.model} not found in {args.models_config}")
     
     model_config = config[args.model]
-    judge_config = config[args.judge_model]
+    judge_model_config = config[args.judge_model]
+    model_name = model_config.get('model')
+    generation_config = model_config.get('generation_config', {})
 
-    generation_agent = get_llm_agent_class(**model_config)
-    judge_agent = get_llm_agent_class(**judge_config)
+
+    judge_model_name = judge_model_config.get('model')
+    judge_generation_config = judge_model_config.get('generation_config', {})
+
+    print(f"Initializing generation agent: {model_name}")
+    generation_agent = get_llm_agent_class(model_name, generation_config=generation_config)
+    
+    print(f"Initializing judge agent: {args.judge_model}")
+    judge_agent = get_llm_agent_class(judge_model_name, generation_config=judge_generation_config)
     
     print("\n" + "=" * 80)
     print("MASK BENCHMARK EVALUATION")

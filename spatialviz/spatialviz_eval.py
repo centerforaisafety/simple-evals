@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-MindCube-Tiny Evaluation Script
-"""
-
 import asyncio
 import os
 import json
@@ -13,6 +9,7 @@ from pathlib import Path
 from tqdm import tqdm
 from datasets import load_dataset
 from dotenv import load_dotenv
+import base64
 
 load_dotenv()
 
@@ -22,23 +19,46 @@ sys.path.append(str(Path(__file__).parent.parent))
 from shared import get_llm_agent_class, get_agent_config
 
 # =============== PROMPTS ===============
-SYSTEM_PROMPT = """You are evaluating spatial mental modeling questions with multimodal content. You will be shown images and text that form questions about spatial reasoning, object relationships, and cognitive mapping. Please analyze the content carefully and provide your response following the required format.
-
-Your final choice should be boxed in the following format:
+SYSTEM_PROMPT = """Please provide your answer in the following format:
 $\\boxed{choice}$
 
 For example: $\\boxed{A}$"""
 
+# Path to images directory
+IMAGES_DIR = Path(__file__).parent / "images"
 
-def load_mindcube_data(dataset: str, max_samples: int = None):
-    """Load MindCube dataset from Hugging Face."""
-    print(f"Loading MindCube dataset from Hugging Face: {dataset}")
+
+def download_images_if_needed():
+    """Download and extract images if not already present."""
+    # Check if images directory exists and has content
+    if IMAGES_DIR.exists() and any(IMAGES_DIR.iterdir()):
+        return
+    
+    print("Downloading SpatialViz images (~150MB)...")
+    import subprocess
+    import zipfile
+    
+    script_dir = Path(__file__).parent
+    zip_path = script_dir / "images.zip"
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Download images
+    url = "https://huggingface.co/datasets/PLM-Team/Spatial-Visualization-Benchmark/resolve/main/images.zip"
+    subprocess.run(["wget", "-O", str(zip_path), url], check=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        z.extractall(IMAGES_DIR)
+    zip_path.unlink()
+
+
+def load_spatialviz_data(dataset: str, max_samples: int = None):
+    """Load SpatialViz dataset from Hugging Face."""
+    print(f"Loading SpatialViz dataset from Hugging Face: {dataset}")
     
     hf_token = os.getenv('HF_TOKEN')
     if not hf_token:
         raise ValueError("HF_TOKEN not found in environment variables")
     
-    dataset_obj = load_dataset(dataset, split="train", token=hf_token)
+    dataset_obj = load_dataset(dataset, split="test", token=hf_token).shuffle(seed=42)
     examples = [dict(example) for example in dataset_obj]
     
     # Limit samples if requested
@@ -49,24 +69,52 @@ def load_mindcube_data(dataset: str, max_samples: int = None):
     return examples
 
 
+def load_and_encode_image(image_path: Path) -> str:
+    """Load image and encode as base64."""
+    with open(image_path, 'rb') as f:
+        image_data = f.read()
+    return base64.b64encode(image_data).decode('utf-8')
+
+
 def format_message(example):
     """Format example into message format for the model."""
-    question = example['question']
-    base64_images = example['images_base64']
+    # Build the question with choices
+    question_text = example['Question']
+    choices = example['Choices']
     
-    # Build multimodal content (images first, then question)
-    content = []
+    # Format choices as A, B, C, D
+    formatted_choices = "\n".join([f"{chr(65+i)}. {choice}" for i, choice in enumerate(choices)])
+    full_question = f"{question_text}\n\n{formatted_choices}"
     
-    for img_b64 in base64_images:
-        content.append({
+    # Load image
+    image_id = example['Image_id']
+    category = example['Category']
+    task = example['Task']
+    level = example['Level']
+    
+    # Image path format: {Category}/{Task}/{Level}/{Image_id}.png
+    image_path = IMAGES_DIR / category / task / level / f"{image_id}.png"
+    
+    if not image_path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    
+    # Encode image
+    image_b64 = load_and_encode_image(image_path)
+    
+    # Build multimodal content (image first, then question)
+    content = [
+        {
             "type": "image_url",
             "image_url": {
-                "url": f'data:image/png;base64,{img_b64}',
+                "url": f'data:image/png;base64,{image_b64}',
                 "detail": "high"
             }
-        })
-    
-    content.append({"type": "text", "text": question})
+        },
+        {
+            "type": "text",
+            "text": full_question
+        }
+    ]
     
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -78,14 +126,14 @@ def format_message(example):
 def parse_answer(response_text: str, ground_truth: str):
     """Parse and evaluate answer from response."""
     # Extract answer from boxed format: $\boxed{A}$ or \boxed{A}
-    pattern = r'\\boxed\{([^}]+)\}'
-    matches = re.findall(pattern, response_text, re.IGNORECASE | re.DOTALL)
+    pattern = r'\\boxed\{([A-D])\}'
+    matches = re.findall(pattern, response_text, re.IGNORECASE)
     
     if not matches:
         return None  # No valid answer found, trigger retry
     
-    extracted_answer = matches[-1].strip()
-    is_correct = extracted_answer.strip().upper() == ground_truth.strip().upper()
+    extracted_answer = matches[-1].upper()
+    is_correct = extracted_answer == ground_truth.strip().upper()
     
     return {
         'extracted_answer': extracted_answer,
@@ -98,14 +146,23 @@ def compute_metrics(results):
     total = len(results)
     correct = sum(r['is_correct'] for r in results)
     
-    # Group by MindCube categories (around, rotation, among)
+    # Group by category
     category_stats = {}
     for r in results:
-        setting = r.get('setting', 'other')
-        if setting not in category_stats:
-            category_stats[setting] = {'correct': 0, 'total': 0}
-        category_stats[setting]['total'] += 1
-        category_stats[setting]['correct'] += r['is_correct']
+        category = r['Category']
+        if category not in category_stats:
+            category_stats[category] = {'correct': 0, 'total': 0}
+        category_stats[category]['total'] += 1
+        category_stats[category]['correct'] += r['is_correct']
+    
+    # Group by task
+    task_stats = {}
+    for r in results:
+        task = r['Task']
+        if task not in task_stats:
+            task_stats[task] = {'correct': 0, 'total': 0}
+        task_stats[task]['total'] += 1
+        task_stats[task]['correct'] += r['is_correct']
     
     return {
         'accuracy': round(100 * correct / total, 2) if total > 0 else 0,
@@ -114,7 +171,11 @@ def compute_metrics(results):
         'category_accuracy': {k: round(100 * v['correct'] / v['total'], 2) 
                              for k, v in category_stats.items() if v['total'] > 0},
         'category_counts': {k: f"{v['correct']}/{v['total']}" 
-                           for k, v in category_stats.items() if v['total'] > 0}
+                           for k, v in category_stats.items() if v['total'] > 0},
+        'task_accuracy': {k: round(100 * v['correct'] / v['total'], 2) 
+                         for k, v in task_stats.items() if v['total'] > 0},
+        'task_counts': {k: f"{v['correct']}/{v['total']}" 
+                       for k, v in task_stats.items() if v['total'] > 0}
     }
 
 
@@ -130,7 +191,7 @@ async def get_model_prediction(agent, example, example_idx, max_attempts: int = 
             assert content is not None, "Model returned None content"
             
             # Parse and evaluate the answer
-            parse_result = parse_answer(content, example['answer'])
+            parse_result = parse_answer(content, example['Answer'])
             if parse_result is None:
                 raise ValueError("Response does not contain properly formatted answer")
             
@@ -141,7 +202,6 @@ async def get_model_prediction(agent, example, example_idx, max_attempts: int = 
                 'response': content,
                 'extracted_answer': parse_result['extracted_answer'],
                 'is_correct': parse_result['is_correct'],
-                'num_images': len(example['images_base64'])
             }
             
         except Exception as e:
@@ -156,10 +216,10 @@ async def generate_predictions(agent,
                                 dataset: str,
                                 max_concurrent: int = 10,
                                 max_samples: int = None):
-    """Generate model predictions for MindCube dataset."""
+    """Generate model predictions for SpatialViz dataset."""
     
-    # Load MindCube dataset
-    examples = load_mindcube_data(dataset, max_samples=max_samples)
+    # Load SpatialViz dataset
+    examples = load_spatialviz_data(dataset, max_samples=max_samples)
     
     # Create semaphore for concurrent processing
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -194,12 +254,12 @@ async def generate_predictions(agent,
 
 def run_eval(model: str,
              output_file: str = None,
-             dataset: str = "justinphan3110/mindcube",
+             dataset: str = "PLM-Team/Spatial-Visualization-Benchmark",
              models_config: str = "configs/models.yaml",
-             max_concurrent: int = 10,
+             max_concurrent: int = 32,
              max_samples: int = None):
     """
-    Run MindCube evaluation.
+    Run SpatialViz evaluation.
     
     Args:
         model: Model name from models.yaml
@@ -209,6 +269,9 @@ def run_eval(model: str,
         max_concurrent: Maximum number of concurrent API calls
         max_samples: If set, limit evaluation to first N samples
     """
+    # Download images if needed
+    download_images_if_needed()
+    
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -227,30 +290,43 @@ def run_eval(model: str,
     # Compute metrics
     metrics = compute_metrics(results)
     
-    print("\n=== MindCube Results ===")
+    print("\n=== SpatialViz Results ===")
     print(f"Dataset: {dataset}")
     print(f"Accuracy: {metrics['accuracy']}% ({metrics['correct']}/{metrics['total']})")
     print(f"Evaluated: {metrics['total']} examples")
+    
     print("\nBy category:")
-    for category, acc in metrics['category_accuracy'].items():
+    for category, acc in sorted(metrics['category_accuracy'].items()):
         counts = metrics['category_counts'][category]
-        print(f"  {category.capitalize()}: {acc}% ({counts})")
+        print(f"  {category}: {acc}% ({counts})")
+    
+    print("\nBy task:")
+    for task, acc in sorted(metrics['task_accuracy'].items()):
+        counts = metrics['task_counts'][task]
+        print(f"  {task}: {acc}% ({counts})")
     
     print("\n===== Token Usage =====")
-    print(f"Model: {model_agent.all_token_usage} | Max: {model_agent.max_token_usage}")
+    print(f"Total Cost: ${model_agent.all_token_usage.cost:.4f}")
+    print(f"Tokens: {model_agent.all_token_usage}")
+    print(f"Max Single Request: {model_agent.max_token_usage}")
     
     # Save results
     print(f"\nSaving results to {output_path}")
     
-    # Remove heavy/non-serializable fields before saving
-    for result in results:
-        result.pop("images_base64", None)
+    # Save full results with metadata
+    output_data = {
+        'model': model,
+        'dataset': dataset,
+        'metrics': metrics,
+        'results': results
+    }
     
     with open(output_path, 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump(output_data, f, indent=4)
     
     print(f"Results saved successfully!")
 
 
 if __name__ == '__main__':
     fire.Fire(run_eval)
+

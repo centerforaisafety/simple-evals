@@ -10,10 +10,13 @@ from typing import Dict, Any
 import anthropic
 import openai
 from pydantic import BaseModel
+import litellm
+litellm.suppress_debug_info = True
+litellm.register_model(model_cost=
+"https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")
 
 from dotenv import load_dotenv
 load_dotenv()
-
 TIMEOUT=3600
 print(f"TIMEOUT: {TIMEOUT}")
 
@@ -36,6 +39,7 @@ class TokenUsage(BaseModel):
   output_tokens: int = 0
   total_tokens: int = 0
   cached_tokens: int = 0
+  cost: float = 0.0
 
 class LLMResponse(BaseModel):
   content: str | None = None
@@ -44,10 +48,34 @@ class LLMResponse(BaseModel):
 
 
 class LLMAgent(ABC):
-  def __init__(self, model: str):
+  def __init__(self, model: str, provider: str = None):
     self.model = model
+    self.provider = provider
     self.all_token_usage = TokenUsage()
     self.max_token_usage = TokenUsage()
+    self._usage_lock = asyncio.Lock()  # Lock for async usage updates
+
+  def _update_usage(self, token_usage: TokenUsage):
+    self.all_token_usage = sum_token_usage([self.all_token_usage, token_usage])
+    self.max_token_usage = get_max_token_usage([self.max_token_usage, token_usage])
+
+  async def _update_usage_async(self, token_usage: TokenUsage):
+    """Update token usage asynchronously with lock (for concurrent async calls)."""
+    async with self._usage_lock:
+      self.all_token_usage = sum_token_usage([self.all_token_usage, token_usage])
+      self.max_token_usage = get_max_token_usage([self.max_token_usage, token_usage])
+    
+  def _calculate_cost(self, response: Any) -> float:
+    # Add total_tokens field if missing (e.g., Anthropic responses don't have this)
+    usage = getattr(response, 'usage', None)
+    if usage and not hasattr(usage, 'total_tokens'):
+      usage.total_tokens = getattr(usage, 'input_tokens', 0) + getattr(usage, 'output_tokens', 0)
+    
+    try:
+      cost = litellm.cost_calculator.completion_cost(completion_response=response, custom_llm_provider=self.provider)
+    except Exception:
+      cost = 0.0
+    return cost
 
   @abstractmethod
   def _completions(self, messages) -> LLMResponse:
@@ -68,8 +96,9 @@ class OpenAIAgent(LLMAgent):
                model: str,
                api_key_env: str = 'OPENAI_API_KEY',
                api_base_url: str = os.getenv('OPENAI_API_BASE_URL', 'https://api.openai.com/v1'),
+               provider: str = 'openai',
                **generation_config):
-    super().__init__(model)
+    super().__init__(model=model, provider=provider)
 
     api_key = os.getenv(api_key_env)
     if not api_key:
@@ -83,23 +112,24 @@ class OpenAIAgent(LLMAgent):
     return messages
 
   def _parse_response(self, response):
+    """Parse response and extract content, token usage, and cost."""
     content = response.choices[0].message.content
     usage = response.usage
     cached_tokens = getattr(getattr(usage, 'prompt_tokens_details', None), 'cached_tokens', 0)
 
+    cost = self._calculate_cost(response)
     token_usage = TokenUsage(
       input_tokens=usage.prompt_tokens,
       output_tokens=usage.completion_tokens,
       total_tokens=usage.total_tokens,
       cached_tokens=cached_tokens,
+      cost=cost,
     )
 
     # Convert response to dict for raw logging
     raw_response = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
-
-    self.all_token_usage = sum_token_usage([self.all_token_usage, token_usage])
-    self.max_token_usage = get_max_token_usage([self.max_token_usage, token_usage])
-    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
+    
+    return content, token_usage, raw_response
 
   def _completions(self, messages: list[dict], **kwargs) -> LLMResponse:
     messages = self._preprocess_messages(messages)
@@ -109,7 +139,10 @@ class OpenAIAgent(LLMAgent):
       **self.generation_config,
       **kwargs,
     )
-    return self._parse_response(response)
+    content, token_usage, raw_response = self._parse_response(response)
+    self._update_usage(token_usage)
+    
+    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
 
   async def _async_completions(self, messages: list[dict], **kwargs) -> LLMResponse:
     messages = self._preprocess_messages(messages)
@@ -119,17 +152,22 @@ class OpenAIAgent(LLMAgent):
       **self.generation_config,
       **kwargs,
     )
-    return self._parse_response(response)
+    content, token_usage, raw_response = self._parse_response(response)
+    await self._update_usage_async(token_usage)
+    
+    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
 
 
 class GrokAgent(OpenAIAgent):
   def __init__(self, model: str,
                api_key_env: str = 'XAI_API_KEY',
                api_base_url: str = 'https://api.x.ai/v1', 
+               provider: str = 'xai',
                **generation_config):
     super().__init__(model=model, 
                      api_key_env=api_key_env, 
                      api_base_url=api_base_url, 
+                     provider=provider,
                      **generation_config)
     # Check if this is a grok-4 model that needs conversation flattening
     self.needs_flattening = 'grok-4' in model.lower() and "grok-4-fast" not in model.lower()
@@ -173,6 +211,7 @@ class GeminiAgent(OpenAIAgent):
   def __init__(self, model: str, 
                api_key_env: str = 'GEMINI_API_KEY',
                api_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/",
+               provider: str = 'gemini',
                vertexai: bool = False,
                **generation_config):
 
@@ -180,6 +219,7 @@ class GeminiAgent(OpenAIAgent):
         super().__init__(model=model,
                          api_key_env=api_key_env, 
                          api_base_url=api_base_url, 
+                         provider=provider,
                          **generation_config)
     else:
         # https://colab.research.google.com/github/GoogleCloudPlatform/generative-ai/blob/main/gemini/chat-completions/intro_chat_completions_api.ipynb
@@ -208,8 +248,11 @@ class AnthropicAgent(LLMAgent):
   def __init__(self, model: str,
                use_cache: bool = False,
                vertexai: bool = False,
+               provider: str = 'anthropic',
                **generation_config):
-    super().__init__(model)
+    # Determine provider before parent init
+    provider = 'vertex_ai' if vertexai else provider
+    super().__init__(model=model, provider=provider)
 
     if vertexai:
       # pip install --upgrade anthropic[vertexai]
@@ -283,23 +326,23 @@ class AnthropicAgent(LLMAgent):
     return system, caching_messages
 
   def _parse_response(self, response):
+    """Parse response and extract content, token usage, and cost."""
     content = response.content[-1].text
     usage = response.usage
+    cost = self._calculate_cost(response)
 
     token_usage = TokenUsage(
       input_tokens=usage.input_tokens + usage.cache_creation_input_tokens,
       output_tokens=usage.output_tokens,
       cached_tokens=usage.cache_read_input_tokens,
       total_tokens=usage.input_tokens + usage.output_tokens,
+      cost=cost,
     )
     
     # Convert response to dict for raw logging
     raw_response = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
     
-    self.all_token_usage = sum_token_usage([self.all_token_usage, token_usage])
-    self.max_token_usage = get_max_token_usage([self.max_token_usage, token_usage])
-    
-    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
+    return content, token_usage, raw_response
 
   def _completions(self, messages: list[dict]) -> str:
     system, messages = self._preprocess_messages(messages)
@@ -312,7 +355,10 @@ class AnthropicAgent(LLMAgent):
       kwargs["system"] = system
     
     response = self.client.messages.create(**kwargs)
-    return self._parse_response(response)
+    content, token_usage, raw_response = self._parse_response(response)
+    self._update_usage(token_usage)
+    
+    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
 
   async def _async_completions(self, messages: list[dict]) -> LLMResponse:
     system, messages = self._preprocess_messages(messages)
@@ -325,16 +371,21 @@ class AnthropicAgent(LLMAgent):
       kwargs["system"] = system
     
     response = await self.async_client.messages.create(**kwargs)
-    return self._parse_response(response)
+    content, token_usage, raw_response = self._parse_response(response)
+    await self._update_usage_async(token_usage)
+    
+    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
 
 class OpenRouterAgent(OpenAIAgent):
   def __init__(self, model: str,
                api_key_env: str = 'OPENROUTER_API_KEY',
                api_base_url: str = 'https://openrouter.ai/api/v1',
+               provider: str = 'openrouter',
                **generation_config):
     super().__init__(model=model,
                      api_key_env=api_key_env,
                      api_base_url=api_base_url,
+                     provider=provider,
                      **generation_config)
 
 # =================== Utils ===================
@@ -368,13 +419,16 @@ def sum_token_usage(token_usages: list[TokenUsage]):
   output_tokens = sum(t.output_tokens for t in token_usages)
   total_tokens = sum(t.total_tokens for t in token_usages)
   cached_tokens = sum(t.cached_tokens for t in token_usages)
+  cost = sum(t.cost for t in token_usages)
   return TokenUsage(input_tokens=input_tokens, 
                     output_tokens=output_tokens, 
                     total_tokens=total_tokens, 
-                    cached_tokens=cached_tokens)
+                    cached_tokens=cached_tokens,
+                    cost=cost)
 
 def get_max_token_usage(token_usages: list[TokenUsage]):
   return TokenUsage(input_tokens=max(t.input_tokens for t in token_usages), 
                     output_tokens=max(t.output_tokens for t in token_usages), 
                     total_tokens=max(t.total_tokens for t in token_usages), 
-                    cached_tokens=max(t.cached_tokens for t in token_usages))
+                    cached_tokens=max(t.cached_tokens for t in token_usages),
+                    cost=max(t.cost for t in token_usages))

@@ -71,12 +71,21 @@ def extract_xml_response(content: str) -> tuple[str, str]:
 def get_system_prompt(env, with_clues: bool):
     """Generate system prompt for the game with XML output format."""
     game_name = env.game_name
-    feelies = env.feelies
     
-    feelies_prompt = ""
-    if with_clues:
-        feelies_prompt = f"""Here are the original Guidelines and Clues for the game {game_name}:
-{feelies}
+    # Build guidelines section (always included)
+    guidelines_prompt = ""
+    if env.guidelines:
+        guidelines_prompt = f"""Here are the original Guidelines for the game {game_name}:
+=====[Guidelines]=====
+{env.guidelines}
+"""
+    
+    # Build clues section (only if with_clues=True)
+    clues_prompt = ""
+    if with_clues and env.invisiclues:
+        clues_prompt = f"""
+=====[Invisiclues]=====
+{env.invisiclues}
 """
 
     system_prompt = f"""You are a text-based game player. Your goal is to finish the game.
@@ -86,7 +95,7 @@ MAX SCORE: {game_info[game_name]['max_score']}
 
 During each game turn, you will be given an observation of the current game state. To take an action, generate a single parser command action.
 
-{feelies_prompt}
+{guidelines_prompt}{clues_prompt}
 
 [OUTPUT FORMAT DURING GAME TURNS]
 Respond using the following XML-style format:
@@ -126,6 +135,7 @@ async def play_single_game(
     with_clues: bool = False,
     max_retries: int = 3,
     redo: bool = False,
+    debug: bool = False,
 ):
     """Play a single game and save results."""
     logger = logging.getLogger(game_name)
@@ -154,10 +164,14 @@ async def play_single_game(
     logs = []
     game_over = False
     
+    pbar = tqdm(total=max_steps, desc=f"Game: {game_name}", leave=False, disable=False)
     try:
-        for step in tqdm(range(max_steps), desc=f"Game: {game_name}"):
+        for step in range(max_steps):
             score = info.get('score', 0)
             progress = info.get('game_progress', 0)
+            
+            pbar.update(step - pbar.n)
+            pbar.set_postfix({"score": score, "progress": f"{progress}%"})
             
             if game_over:
                 observation += '''
@@ -189,10 +203,7 @@ async def play_single_game(
                     
                     # Format response for history
                     formatted_response = f"<reasoning>\n{reasoning}\n</reasoning>\n<action>\n{action}\n</action>"
-                    history.append({
-                        "role": "assistant", 
-                        "content": formatted_response
-                    })
+                    history.append({"role": "assistant", "content": formatted_response})
                     
                     break  # Successfully extracted action
                     
@@ -231,6 +242,8 @@ async def play_single_game(
 
     except Exception as e:
         logger.error(f"Error during game execution: {e}", exc_info=True)
+    finally:
+        pbar.close()
 
     result = {
         'game_name': game_name,
@@ -240,6 +253,7 @@ async def play_single_game(
         'progress': info.get('game_progress', 0),
         'score': info.get('score', 0),
         'total_restore': env.get_total_restores(),
+        'system_prompt': system_content['content'],
         'logs': logs,
     }
     
@@ -492,14 +506,19 @@ async def main():
                         with_clues=args.with_clues,
                         max_retries=args.max_retries,
                         redo=args.redo,
+                        debug=args.debug,
                     )
                 except Exception as e:
                     logger.error(f"Error playing game {game}: {e}", exc_info=True)
         
         # Run all games with progress bar
         tasks = [run_game_with_semaphore(game) for game in all_games]
-        for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Playing games"):
+        pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Playing games")
+        for task in pbar:
             await task
+            # Update cost in progress bar
+            cost = agent.all_token_usage.cost
+            pbar.set_postfix({"cost": f"${cost:.2f}"})
         
         # Print token usage
         print("\n" + "=" * 80)
