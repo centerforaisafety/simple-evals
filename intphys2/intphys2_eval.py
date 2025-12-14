@@ -37,13 +37,13 @@ def load_intphys2_data(dataset: str, max_samples: int = None):
         raise ValueError("HF_TOKEN not found in environment variables")
     
     dataset_obj = load_dataset(dataset, split="train", token=hf_token)
-    examples = [dict(example) for example in dataset_obj]
+    examples = [dict(example) for example in dataset_obj] * 3
     
     # Limit samples if requested
     if max_samples:
         examples = examples[:max_samples]
     
-    print(f"Loaded {len(examples)} videos")
+    print(f"Loaded {len(dataset_obj)} unique examples (augmented to {len(examples)} total evaluations)")
     return examples
 
 
