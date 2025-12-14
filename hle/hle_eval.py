@@ -63,7 +63,7 @@ def load_hle_data(dataset: str, max_samples: int = None, text_only: bool = False
     if text_only:
         questions = [q for q in questions if not q.get('image')]
         print(f"Text-only mode: filtered to {len(questions)} questions without images")
-    
+
     # Limit samples if requested
     if max_samples:
         questions = questions[:max_samples]
@@ -92,44 +92,44 @@ def format_message(question):
     return messages
 
 
-async def get_model_prediction(agent, question, max_attempts: int = 3):
-    """Get model prediction for a single question."""
+async def get_model_prediction_and_judge(model_agent, judge_agent, question, question_idx, max_attempts: int = 5):
+    """Get model prediction and immediately judge it for a single question."""
     messages = format_message(question)
     
-    # Try to get response with retries
+    # Step 1: Get model prediction
     content = None
     for attempt in range(max_attempts):
         try:
-            response = await agent.async_completions(messages=messages)
+            response = await model_agent.async_completions(messages=messages)
             content = response.content
             assert content is not None, "Model returned None content"
             break
             
         except Exception as e:
             if attempt == max_attempts - 1:
-                print(f"{max_attempts} attempts failed for question {question['id']} : {e}")
-                
-    return dict(**question, response=content)
-
-
-async def judge_answer(judge_agent, question, max_attempts: int = 3):
-    """Judge if the model's answer is correct using XML parsing."""
+                print(f"\n{max_attempts} prediction attempts failed for question {question['id']}: {e}")
+            
+    
+    # If prediction failed, return None
+    if content is None:
+        return None
+    
+    # Step 2: Judge the answer
     question_text = question["question"]
     correct_answer = question["answer"]
-    response = question["response"]
     
     prompt = JUDGE_PROMPT.format(
         question=question_text,
         correct_answer=correct_answer,
-        response=response
+        response=content
     )
     
     judge_response = None
     for attempt in range(max_attempts):
         try:
             judge_messages = [{"role": "user", "content": prompt}]
-            response = await judge_agent.async_completions(messages=judge_messages)
-            judge_content = response.content
+            judge_result = await judge_agent.async_completions(messages=judge_messages)
+            judge_content = judge_result.content
             
             extracted_answer_match = re.search(r'<extracted_final_answer>(.*?)</extracted_final_answer>', judge_content, re.DOTALL | re.IGNORECASE)
             reasoning_match = re.search(r'<reasoning>(.*?)</reasoning>', judge_content, re.DOTALL | re.IGNORECASE)
@@ -152,12 +152,20 @@ async def judge_answer(judge_agent, question, max_attempts: int = 3):
             
         except Exception as e:
             if attempt == max_attempts - 1:
-                print(f"{max_attempts} judge attempts failed for question {question['id']}: {e}")
+                print(f"\n{max_attempts} judge attempts failed for question {question['id']}: {e}")
     
-    # Update question with new judge response (overrides existing if present)
-    result = dict(**question)
-    result['judge_response'] = judge_response
-    return result
+    # If judge failed, return None
+    if judge_response is None:
+        return None
+    
+    # Return complete result with both prediction and judgment
+    return {
+        **question,
+        'question_idx': question_idx,
+        'response': content,
+        'judge_response': judge_response,
+        'is_correct': "yes" in judge_response["correct"]
+    }
 
 # Source: https://github.com/hendrycks/outlier-exposure/blob/master/utils/calibration_tools.py
 def calib_err(confidence, correct, p='2', beta=100):
@@ -203,7 +211,7 @@ def calib_err(confidence, correct, p='2', beta=100):
     return cerr
 
 
-def compute_metrics(predictions, total_questions):
+def compute_metrics(predictions, total_questions, num_failed):
     """Compute accuracy and calibration metrics from predictions."""
     correct = []
     confidence = []
@@ -217,26 +225,37 @@ def compute_metrics(predictions, total_questions):
     correct = np.array(correct)
     confidence = np.array(confidence) / 100
     
-    print(f"Available predictions: {len(correct)} | Total questions: {total_questions}")
+    num_evaluated = len(correct)
+    print(f"Successfully evaluated: {num_evaluated} | Failed: {num_failed} | Total questions: {total_questions}")
     
-    accuracy = 100 * sum(correct) / total_questions
-    # Wald estimator, 95% confidence interval
-    confidence_half_width = 1.96 * math.sqrt(accuracy * (100 - accuracy) / total_questions)
-    calibration_error = 100 * calib_err(confidence, correct, p='2', beta=100)
+    # Calculate accuracy for success cases only
+    accuracy_success_only = 100 * sum(correct) / num_evaluated if num_evaluated > 0 else 0.0
+    # Wald estimator, 95% confidence interval (for success cases)
+    confidence_half_width_success = 1.96 * math.sqrt(accuracy_success_only * (100 - accuracy_success_only) / num_evaluated) if num_evaluated > 0 else 0.0
+    calibration_error = 100 * calib_err(confidence, correct, p='2', beta=100) if num_evaluated > 0 else 0.0
+    
+    # Calculate overall accuracy (treating failed as incorrect)
+    accuracy_overall = 100 * sum(correct) / total_questions if total_questions > 0 else 0.0
+    confidence_half_width_overall = 1.96 * math.sqrt(accuracy_overall * (100 - accuracy_overall) / total_questions) if total_questions > 0 else 0.0
     
     return {
-        'accuracy': round(accuracy, 2),
-        'confidence_interval': round(confidence_half_width, 2),
+        'accuracy': round(accuracy_overall, 2),
+        'confidence_interval': round(confidence_half_width_overall, 2),
+        'accuracy_success_only': round(accuracy_success_only, 2),
+        'confidence_interval_success_only': round(confidence_half_width_success, 2),
         'calibration_error': round(calibration_error, 2),
-        'evaluated_questions': len(correct),
+        'evaluated_questions': num_evaluated,
+        'failed_questions': num_failed,
+        'total_questions': total_questions,
     }
 
-async def generate_predictions(agent,
-                                dataset: str,
-                                max_concurrent: int = 10,
-                                text_only: bool = False,
-                                max_samples: int = None):
-    """Generate model predictions without judging."""
+async def generate_predictions_and_judge(model_agent,
+                                          judge_agent,
+                                          dataset: str,
+                                          max_concurrent: int = 10,
+                                          text_only: bool = False,
+                                          max_samples: int = None):
+    """Generate model predictions and judge them in parallel."""
     
     # Load HLE dataset (filter by text_only at load time)
     questions = load_hle_data(dataset, max_samples=max_samples, text_only=text_only)
@@ -244,50 +263,44 @@ async def generate_predictions(agent,
     # Create semaphore for concurrent processing
     semaphore = asyncio.Semaphore(max_concurrent)
     
-    async def predict_with_semaphore(question):
+    async def predict_and_judge_with_semaphore(question, idx):
         async with semaphore:
-            return await get_model_prediction(agent, question)
+            return await get_model_prediction_and_judge(model_agent, judge_agent, question, idx)
     
     # Process all questions
-    print(f"Generating predictions for {len(questions)} questions...")
-    tasks = [predict_with_semaphore(question) for question in questions]
+    print(f"Generating predictions and judging for {len(questions)} questions...")
+    tasks = [predict_and_judge_with_semaphore(question, idx) for idx, question in enumerate(questions)]
     
     results = []
-    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Generating predictions"):
+    correct = 0
+    num_failed = 0
+    pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Evaluating")
+    for task in pbar:
         result = await task
         if result:
             results.append(result)
+            correct += int(result['is_correct'])
+            
+            # Update progress bar with accuracy and model cost only
+            accuracy = 100 * correct / len(results)
+            model_cost = model_agent.all_token_usage.cost
+            pbar.set_postfix({
+                "acc": f"{accuracy:.1f}%",
+                "cost": f"${model_cost:.3f}"
+            })
+        else:
+            num_failed += 1
+            accuracy = 100 * correct / len(results) if results else 0.0
+            model_cost = model_agent.all_token_usage.cost
+            pbar.set_postfix({
+                "acc": f"{accuracy:.1f}%",
+                "cost": f"${model_cost:.3f}"
+            })
     
-    return results
-
-
-async def judge_predictions(judge_agent,
-                             questions: list,
-                             max_concurrent: int = 128):
-    """Judge existing predictions."""    
-    # Filter to questions that have predictions
-    print(f"Judging {len(questions)} predictions...")
+    # Compute final metrics
+    metrics = compute_metrics(results, len(questions), num_failed)
     
-    # Create semaphore for concurrent processing
-    semaphore = asyncio.Semaphore(max_concurrent)
-    
-    async def judge_with_semaphore(question):
-        async with semaphore:        
-            judge_result = await judge_answer(judge_agent, question)
-            return judge_result  # Already contains all question fields
-    
-    # Process all questions
-    tasks = [judge_with_semaphore(question) for question in questions]
-    
-    judged_results = []
-    for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Judging predictions"):
-        result = await task
-        judged_results.append(result)
-    
-    # Compute metrics
-    metrics = compute_metrics(judged_results, len(questions))
-    
-    return judged_results, metrics
+    return results, metrics
 
 
 def run_eval(model: str,
@@ -297,21 +310,19 @@ def run_eval(model: str,
              models_config: str = "configs/models.yaml",
              max_concurrent: int = 10,
              text_only: bool = False,
-             max_samples: int = None,
-             judge_only: bool = False):
+             max_samples: int = None):
     """
     Run HLE evaluation.
     
     Args:
-        model: Model name from models.yaml (required unless judge_only=True)
+        model: Model name from models.yaml (required)
         dataset: HuggingFace dataset identifier
         output_file: Path to output file (required)
-        judge: Judge model name from models.yaml (default: gpt-5-mini)
+        judge_model: Judge model name from models.yaml (default: gpt-5-mini)
         models_config: Path to models configuration file
         max_concurrent: Maximum number of concurrent API calls
         text_only: If True, filter out questions with images
         max_samples: If set, limit evaluation to first N samples
-        judge_only: If True, load predictions from output_file and only run judge
     """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -319,46 +330,31 @@ def run_eval(model: str,
     model_agent = get_llm_agent_class(**get_agent_config(model, models_config))
     judge_agent = get_llm_agent_class(**get_agent_config(judge_model, models_config))
     
-    if not judge_only:
-        # Step 1: Generate predictions
-        predictions = asyncio.run(
-            generate_predictions(
-                agent=model_agent,
-                dataset=dataset,
-                max_concurrent=max_concurrent,
-                text_only=text_only,
-                max_samples=max_samples
-            )
-        )
-    else:
-        # Judge-only mode: load existing predictions and judge them
-        if not output_path.exists():
-            raise ValueError(f"Cannot run judge_only mode: {output_file} does not exist")
-        
-        print(f"===>Running in judge-only mode. Loading predictions from: {output_path}")
-        
-        with open(output_path, 'r') as f:
-            saved_data = json.load(f)
-        predictions = saved_data
-
-    # Step 2: Judge predictions
+    # Generate predictions and judge them
     results, metrics = asyncio.run(
-        judge_predictions(
+        generate_predictions_and_judge(
+            model_agent=model_agent,
             judge_agent=judge_agent,
-            questions=predictions,
-            max_concurrent=max_concurrent
+            dataset=dataset,
+            max_concurrent=max_concurrent,
+            text_only=text_only,
+            max_samples=max_samples
         )
     )
 
-    print("\n=== HLE Judge Results ===")
+    print("\n=== HLE Results ===")
     print(f"Dataset: {dataset}")
-    print(f"Accuracy: {metrics['accuracy']}% ± {metrics['confidence_interval']}%")
+    print(f"Overall Accuracy: {metrics['accuracy']}% ± {metrics['confidence_interval']}% (treating failed as incorrect)")
+    print(f"Success-only Accuracy: {metrics['accuracy_success_only']}% ± {metrics['confidence_interval_success_only']}% (only successful evaluations)")
     print(f"Calibration Error: {metrics['calibration_error']}")
     print(f"Evaluated: {metrics['evaluated_questions']} questions")
+    print(f"Failed: {metrics['failed_questions']} questions")
+    print(f"Total: {metrics['total_questions']} questions")
     
     print("\n===== Token Usage =====")
     print(f"Model: {model_agent.all_token_usage} | Max: {model_agent.max_token_usage}")
     print(f"Judge: {judge_agent.all_token_usage} | Max: {judge_agent.max_token_usage}")
+    print(f"Total Cost: ${model_agent.all_token_usage.cost + judge_agent.all_token_usage.cost:.4f}")
     
     # Save results
     print(f"\nSaving results to {output_path}")
@@ -368,10 +364,18 @@ def run_eval(model: str,
         result.pop("image", None)
         result.pop("image_preview", None)
         result.pop("rationale_image", None)
-
+    
+    # Save with metadata
+    output_data = {
+        'model': model,
+        'judge_model': judge_model,
+        'dataset': dataset,
+        'metrics': metrics,
+        'results': results
+    }
     
     with open(output_path, 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump(output_data, f, indent=4)
     
     print(f"Results saved successfully!")
 
