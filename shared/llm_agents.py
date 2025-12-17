@@ -11,9 +11,16 @@ import anthropic
 import openai
 from pydantic import BaseModel
 import litellm
+import requests
 litellm.suppress_debug_info = True
-litellm.register_model(model_cost=
-"https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")
+try:
+    _model_cost_url = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+    _model_cost_data = requests.get(_model_cost_url, timeout=10).json()
+    # Filter out github_copilot models that trigger OAuth prompts
+    _filtered_model_cost = {k: v for k, v in _model_cost_data.items() if not k.startswith("github_copilot/")}
+    litellm.register_model(model_cost=_filtered_model_cost)
+except Exception as e:
+    print(f"Warning: Failed to load remote model costs: {e}")
 
 from dotenv import load_dotenv
 load_dotenv()
