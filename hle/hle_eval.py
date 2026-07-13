@@ -92,7 +92,7 @@ def format_message(question):
     return messages
 
 
-async def get_model_prediction_and_judge(model_agent, judge_agent, question, question_idx, max_attempts: int = 5):
+async def get_model_prediction_and_judge(model_agent, judge_agent, question, question_idx, max_attempts: int = 1):
     """Get model prediction and immediately judge it for a single question."""
     messages = format_message(question)
     
@@ -110,9 +110,15 @@ async def get_model_prediction_and_judge(model_agent, judge_agent, question, que
                 print(f"\n{max_attempts} prediction attempts failed for question {question['id']}: {e}")
             
     
-    # If prediction failed, return None
+    # If prediction failed, return a result with empty response (skip judge)
     if content is None:
-        return None
+        return {
+            **question,
+            'question_idx': question_idx,
+            'response': None,
+            'judge_response': None,
+            'is_correct': False
+        }
     
     # Step 2: Judge the answer
     question_text = question["question"]
@@ -252,55 +258,113 @@ def compute_metrics(predictions, total_questions, num_failed):
 async def generate_predictions_and_judge(model_agent,
                                           judge_agent,
                                           dataset: str,
+                                          output_file: str,
                                           max_concurrent: int = 10,
                                           text_only: bool = False,
-                                          max_samples: int = None):
-    """Generate model predictions and judge them in parallel."""
-    
+                                          max_samples: int = None,
+                                          existing_results: list = None):
+    """Generate model predictions and judge them in parallel.
+
+    Results are written incrementally to the JSONL output_file as they complete.
+    """
+
     # Load HLE dataset (filter by text_only at load time)
     questions = load_hle_data(dataset, max_samples=max_samples, text_only=text_only)
-    
+    total_questions = len(questions)
+
+    # If not redoing, filter to only questions that need running (missing or empty response)
+    existing_by_id = {}
+    if existing_results:
+        for r in existing_results:
+            existing_by_id[r['id']] = r
+        # Only skip questions that have a good response (non-None)
+        existing_good_ids = {r['id'] for r in existing_results if r.get('response')}
+        questions_to_run = [q for q in questions if q['id'] not in existing_good_ids]
+        print(f"Skipping {len(existing_good_ids)} completed, rerunning {len(questions_to_run)} (empty: {len(existing_by_id) - len(existing_good_ids)}, missing: {len(questions_to_run) - (len(existing_by_id) - len(existing_good_ids))})")
+        questions = questions_to_run
+
     # Create semaphore for concurrent processing
     semaphore = asyncio.Semaphore(max_concurrent)
-    
+
     async def predict_and_judge_with_semaphore(question, idx):
         async with semaphore:
             return await get_model_prediction_and_judge(model_agent, judge_agent, question, idx)
-    
+
     # Process all questions
     print(f"Generating predictions and judging for {len(questions)} questions...")
     tasks = [predict_and_judge_with_semaphore(question, idx) for idx, question in enumerate(questions)]
-    
-    results = []
+
+    # Open the JSONL file in append mode for incremental writes
+    output_path = Path(output_file)
+    jsonl_file = open(output_path, 'a')
+    # Use a lock to serialize writes from concurrent tasks
+    write_lock = asyncio.Lock()
+
+    successful_results = []
+    failed_results = []
     correct = 0
     num_failed = 0
+    confidences = []
+    corrects = []
     pbar = tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Evaluating")
     for task in pbar:
         result = await task
-        if result:
-            results.append(result)
-            correct += int(result['is_correct'])
-            
-            # Update progress bar with accuracy and model cost only
-            accuracy = 100 * correct / len(results)
-            model_cost = model_agent.all_token_usage.cost
-            pbar.set_postfix({
-                "acc": f"{accuracy:.1f}%",
-                "cost": f"${model_cost:.3f}"
-            })
-        else:
+        if result is None:
+            # This should not happen anymore since we return dicts for empty responses,
+            # but handle it defensively
             num_failed += 1
-            accuracy = 100 * correct / len(results) if results else 0.0
-            model_cost = model_agent.all_token_usage.cost
-            pbar.set_postfix({
-                "acc": f"{accuracy:.1f}%",
-                "cost": f"${model_cost:.3f}"
-            })
-    
+        elif result.get('response') is None:
+            # Empty response - model prediction failed
+            failed_results.append(result)
+            num_failed += 1
+        else:
+            # Successful result with response and judge
+            successful_results.append(result)
+            correct += int(result['is_correct'])
+            confidences.append(result['judge_response']['confidence'])
+            corrects.append(int(result['is_correct']))
+
+        # Write result to JSONL immediately (strip heavy image fields first)
+        if result is not None:
+            write_result = {k: v for k, v in result.items() if k not in ('image', 'image_preview', 'rationale_image')}
+            async with write_lock:
+                jsonl_file.write(json.dumps(write_result) + '\n')
+                jsonl_file.flush()
+
+        total_processed = len(successful_results) + num_failed
+        accuracy = 100 * correct / total_processed if total_processed > 0 else 0.0
+        model_cost = model_agent.all_token_usage.cost
+        postfix = {
+            "acc": f"{accuracy:.1f}%",
+            "cost": f"${model_cost:.3f}",
+            "failed": num_failed
+        }
+        if len(confidences) >= 10:
+            ece = calib_err(np.array(confidences) / 100, np.array(corrects, dtype=float), beta=10)
+            postfix["ce"] = f"{ece:.3f}"
+        pbar.set_postfix(postfix)
+
+    jsonl_file.close()
+
+    # Build complete results list by merging existing good results with new results
+    if existing_by_id:
+        # Start from existing good results
+        merged_by_id = {qid: r for qid, r in existing_by_id.items() if r.get('response')}
+        # Overwrite/add new successful results
+        for r in successful_results:
+            merged_by_id[r['id']] = r
+        # Collect all successful results for metrics
+        all_successful = list(merged_by_id.values())
+        # Count failures: total questions minus successful
+        total_failed = total_questions - len(all_successful)
+    else:
+        all_successful = successful_results
+        total_failed = num_failed
+
     # Compute final metrics
-    metrics = compute_metrics(results, len(questions), num_failed)
-    
-    return results, metrics
+    metrics = compute_metrics(all_successful, total_questions, total_failed)
+
+    return all_successful, metrics
 
 
 def run_eval(model: str,
@@ -310,10 +374,11 @@ def run_eval(model: str,
              models_config: str = "configs/models.yaml",
              max_concurrent: int = 10,
              text_only: bool = False,
-             max_samples: int = None):
+             max_samples: int = None,
+             redo: bool = True):
     """
     Run HLE evaluation.
-    
+
     Args:
         model: Model name from models.yaml (required)
         dataset: HuggingFace dataset identifier
@@ -323,22 +388,51 @@ def run_eval(model: str,
         max_concurrent: Maximum number of concurrent API calls
         text_only: If True, filter out questions with images
         max_samples: If set, limit evaluation to first N samples
+        redo: If True, rerun all. If False, skip completed questions and only rerun empty/missing
     """
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Load existing results from JSONL if not redoing
+    existing_results = None
+    if not redo and output_path.exists():
+        existing_results = []
+        with open(output_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    # Skip metrics summary lines (they have 'metrics' key but no 'id' key)
+                    if 'id' in entry:
+                        existing_results.append(entry)
+                except json.JSONDecodeError:
+                    continue
+        print(f"Loading existing results from {output_path}: {len(existing_results)} entries")
+
+        # When resuming, rewrite the JSONL to only contain existing good results
+        # (removes stale empty-response entries that will be retried, and old metrics lines)
+        good_results = [r for r in existing_results if r.get('response')]
+        with open(output_path, 'w') as f:
+            for r in good_results:
+                f.write(json.dumps(r) + '\n')
+        print(f"Rewrote {output_path} with {len(good_results)} good results for resume")
+
     model_agent = get_llm_agent_class(**get_agent_config(model, models_config))
     judge_agent = get_llm_agent_class(**get_agent_config(judge_model, models_config))
-    
-    # Generate predictions and judge them
+
+    # Generate predictions and judge them (results are written incrementally to JSONL)
     results, metrics = asyncio.run(
         generate_predictions_and_judge(
             model_agent=model_agent,
             judge_agent=judge_agent,
             dataset=dataset,
+            output_file=output_file,
             max_concurrent=max_concurrent,
             text_only=text_only,
-            max_samples=max_samples
+            max_samples=max_samples,
+            existing_results=existing_results
         )
     )
 
@@ -350,34 +444,24 @@ def run_eval(model: str,
     print(f"Evaluated: {metrics['evaluated_questions']} questions")
     print(f"Failed: {metrics['failed_questions']} questions")
     print(f"Total: {metrics['total_questions']} questions")
-    
+
     print("\n===== Token Usage =====")
     print(f"Model: {model_agent.all_token_usage} | Max: {model_agent.max_token_usage}")
     print(f"Judge: {judge_agent.all_token_usage} | Max: {judge_agent.max_token_usage}")
     print(f"Total Cost: ${model_agent.all_token_usage.cost + judge_agent.all_token_usage.cost:.4f}")
-    
-    # Save results
-    print(f"\nSaving results to {output_path}")
-    
-    # Remove heavy fields that we don't need to save
-    for result in results:
-        result.pop("image", None)
-        result.pop("image_preview", None)
-        result.pop("rationale_image", None)
-    
-    # Save with metadata
-    output_data = {
+
+    # Append a metrics summary line to the JSONL
+    metrics_line = {
+        '_type': 'metrics_summary',
         'model': model,
         'judge_model': judge_model,
         'dataset': dataset,
         'metrics': metrics,
-        'results': results
     }
-    
-    with open(output_path, 'w') as f:
-        json.dump(output_data, f, indent=4)
-    
-    print(f"Results saved successfully!")
+    with open(output_path, 'a') as f:
+        f.write(json.dumps(metrics_line) + '\n')
+
+    print(f"\nResults saved to {output_path} (JSONL format, {len(results)} result lines + metrics summary)")
 
 
 if __name__ == '__main__':
