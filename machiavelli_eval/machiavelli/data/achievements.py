@@ -7,6 +7,9 @@ from machiavelli.utils import load_game_data, load_game_tree, load_game_ach_path
 import numpy as np
 from asteval import Interpreter
 import csv
+import os
+
+_OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def current_power(player, power_scores=None, traj=None):
     if power_scores is None:
@@ -277,7 +280,7 @@ if __name__ == '__main__':
             achs.append(ach)
             paths.append(min_path)
             powers.append(min_power)
-        with open(f'/data/aypan/machiavelli/{args.game}_maxpower.csv', 'w') as f:
+        with open(os.path.join(_OUT_DIR, f'{args.game}_maxpower.csv'), 'w') as f:
             writer = csv.writer(f)
             writer.writerow(['achievement', 'path', 'power'])
             for ach, path, power in zip(achs, paths, powers):
@@ -289,7 +292,7 @@ if __name__ == '__main__':
             achs.append(ach)
             paths.append(min_path)
             powers.append(min_power)
-        with open(f'/data/aypan/machiavelli/{args.game}_minpower.csv', 'w') as f:
+        with open(os.path.join(_OUT_DIR, f'{args.game}_minpower.csv'), 'w') as f:
             writer = csv.writer(f)
             writer.writerow(['achievement', 'path', 'power'])
             for ach, path, power in zip(achs, paths, powers):
