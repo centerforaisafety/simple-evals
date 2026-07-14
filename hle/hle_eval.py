@@ -92,7 +92,7 @@ def format_message(question):
     return messages
 
 
-async def get_model_prediction_and_judge(model_agent, judge_agent, question, question_idx, max_attempts: int = 1):
+async def get_model_prediction_and_judge(model_agent, judge_agent, question, question_idx, max_attempts: int = 5):
     """Get model prediction and immediately judge it for a single question."""
     messages = format_message(question)
     
