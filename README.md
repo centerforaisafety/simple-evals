@@ -17,6 +17,7 @@ Simple evaluation scripts for AI benchmarks with minimal dependencies.
   - [VCT-Refusal](#vct-refusal)
   - [MASK](#mask)
   - [Machiavelli](#machiavelli)
+  - [PCT (Polarized Contrastive Pairs)](#pct-polarized-contrastive-pairs)
 
 ## Setup
 
@@ -71,6 +72,7 @@ leaderboard_eval/
 ├── vct_refusal/             # VCT-Refusal benchmark
 ├── mask/                    # MASK benchmark
 ├── machiavelli_eval/        # Machiavelli benchmark
+├── pct/                     # PCT benchmark
 └── requirements/            # Requirements
 ```
 
@@ -549,6 +551,60 @@ python -m machiavelli_eval.machiavelli_eval \
   author={Alexander Pan and Chan Jun Shern and Andy Zou and Nathaniel Li and Steven Basart and Thomas Woodside and Jonathan Ng and Hanlin Zhang and Scott Emmons and Dan Hendrycks},
   booktitle={International Conference on Machine Learning},
   year={2023}
+}
+```
+
+</details>
+
+---
+
+### PCT (Polarized Contrastive Pairs)
+
+[Paper](https://arxiv.org/abs/2605.22771) | [Website](https://political-manipulation.ai) | [Code](https://github.com/centerforaisafety/political-manipulation)
+
+Covert political manipulation—measures whether a model is inconsistent in sentiment and helpfulness when responding about opposing political subjects. PCT is a dataset of analogous left- and right-coded entity pairs (Socialism/Capitalism, Obama/Reagan, Gun Control/Second Amendment Rights, and so on), prompted with positive and negative framings of each side across a range of prompt templates.
+
+**Metrics:** PCT Score
+
+The **PCT Score** measures inconsistency across each left/right pair. Each topic pair expands to 4 valences x 5 templates; a judge model scores the sentiment and helpfulness of the response to each side. The score is computed as:
+
+1. Score sentiment and helpfulness for the left- and right-coded response in each pair
+2. Measure the gap between the two sides within each pair
+3. Higher scores indicate more consistent (less politically manipulative) behavior
+
+**Arguments:**
+- `--model`: Model to evaluate (required)
+- `--output_file`: Path to the results JSONL (required)
+- `--topics_file`: Left/right topic-pair JSON (default: `pct/pct_topics.json`)
+- `--models_config`: Path to models config (default: `configs/models.yaml`)
+- `--judge_model`: Judge model (default: `gpt-5`)
+- `--max_concurrent`: Async concurrency across paired records (default: `16`)
+- `--max_samples`: Limit number of topic pairs, for smoke tests (default: all)
+- `--max_attempts`: Retry budget per model/judge call (default: `3`)
+- `--redo`: If `False`, resume from an existing JSONL (default: `True`)
+
+**Example:**
+
+```bash
+python -m pct.pct_eval \
+  --model gpt-5-mini \
+  --output_file results/pct/pct_gpt-5-mini.jsonl \
+  --judge_model gpt-5 \
+  --max_concurrent 16
+```
+
+<details>
+<summary>Citation</summary>
+
+```bibtex
+@misc{phan2026reducingpoliticalmanipulationconsistency,
+  title={Reducing Political Manipulation with Consistency Training},
+  author={Long Phan and Devin Kim and Alexander Pan and Alice Blair and Adam Khoja and Dan Hendrycks},
+  year={2026},
+  eprint={2605.22771},
+  archivePrefix={arXiv},
+  primaryClass={cs.CL},
+  url={https://arxiv.org/abs/2605.22771},
 }
 ```
 
