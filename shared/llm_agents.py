@@ -13,14 +13,23 @@ from pydantic import BaseModel
 import litellm
 import requests
 litellm.suppress_debug_info = True
+
+# Model prices can be loaded from a local snapshot (set MODEL_PRICES_JSON to a
+# local model_prices_and_context_window.json) for reproducibility / offline use,
+# otherwise they are fetched live from the litellm upstream.
+LOCAL_PATH = os.environ.get("MODEL_PRICES_JSON")
+UPSTREAM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 try:
-    _model_cost_url = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-    _model_cost_data = requests.get(_model_cost_url, timeout=10).json()
+    if LOCAL_PATH:
+        with open(LOCAL_PATH) as _f:
+            _model_cost_data = json.load(_f)
+    else:
+        _model_cost_data = requests.get(UPSTREAM_URL, timeout=10).json()
     # Filter out github_copilot models that trigger OAuth prompts
-    _filtered_model_cost = {k: v for k, v in _model_cost_data.items() if not k.startswith("github_copilot/")}
-    litellm.register_model(model_cost=_filtered_model_cost)
+    _model_cost_data = {k: v for k, v in _model_cost_data.items() if not k.startswith("github_copilot/")}
+    litellm.register_model(model_cost=_model_cost_data)
 except Exception as e:
-    print(f"Warning: Failed to load remote model costs: {e}")
+    print(f"Warning: Failed to load model costs ({LOCAL_PATH or UPSTREAM_URL}): {e}")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -50,6 +59,7 @@ class TokenUsage(BaseModel):
 
 class LLMResponse(BaseModel):
   content: str | None = None
+  reasoning_content: str | None = None
   token_usage: TokenUsage | None = None
   raw: dict | None = None
 
@@ -77,11 +87,49 @@ class LLMAgent(ABC):
     usage = getattr(response, 'usage', None)
     if usage and not hasattr(usage, 'total_tokens'):
       usage.total_tokens = getattr(usage, 'input_tokens', 0) + getattr(usage, 'output_tokens', 0)
-    
+
+    # OpenRouter returns the exact cost in `usage.cost` — trust it directly.
+    upstream_cost = getattr(usage, "cost", None)
+    if upstream_cost is not None:
+      return float(upstream_cost)
+    # xAI returns `usage.cost_in_usd_ticks` (1 tick = $1e-10). Some newer models
+    # return the field as 0 before billing is wired — treat a zero/falsy tick as
+    # "no native cost" and fall through to the price table.
+    ticks = getattr(usage, "cost_in_usd_ticks", None)
+    if ticks:
+      return float(ticks) * 1e-10
+
+    # Normalize the response model name so litellm's pricing lookup hits the base
+    # key registered in model_prices_and_context_window.json. xAI returns a
+    # `-internal` suffix (e.g. `grok-4-internal`); OpenAI-style APIs append a
+    # date (e.g. `gpt-4o-2024-08-06`). Fall back to self.model if absent.
+    import re as _re
+    base_model = getattr(response, "model", None) or self.model
+    if base_model:
+      base_model = _re.sub(r"-\d{4}-\d{2}-\d{2}$", "", base_model)
+      base_model = _re.sub(r"-internal$", "", base_model)
+
     try:
-      cost = litellm.cost_calculator.completion_cost(completion_response=response, custom_llm_provider=self.provider)
-    except Exception:
+      cost = litellm.cost_calculator.completion_cost(
+          completion_response=response,
+          model=base_model,
+          custom_llm_provider=self.provider,
+      )
+    except Exception as e:
+      print(f"Warning: Cost calculation failed for {self.provider}/{self.model}: {e}")
       cost = 0.0
+
+    # Recover hidden thinking tokens (Gemini/xAI via OpenAI-compat hide them in total_tokens).
+    pt = getattr(usage, "prompt_tokens", None)
+    ct = getattr(usage, "completion_tokens", None)
+    if pt is not None and ct is not None:
+      hidden = usage.total_tokens - pt - ct
+      if hidden > 0:
+        info = (litellm.model_cost.get(base_model)
+                or litellm.model_cost.get(f"{self.provider}/{base_model}")
+                or litellm.model_cost.get(base_model.split("/", 1)[-1]) or {})
+        cost = (cost or 0.0) + hidden * (info.get("output_cost_per_token") or 0)
+
     return cost
 
   @abstractmethod
@@ -119,10 +167,14 @@ class OpenAIAgent(LLMAgent):
     return messages
 
   def _parse_response(self, response):
-    """Parse response and extract content, token usage, and cost."""
-    content = response.choices[0].message.content
+    """Parse response and extract content, reasoning_content, token usage, and cost."""
+    choice = response.choices[0] if response.choices else None
+    message = getattr(choice, 'message', None) if choice is not None else None
+    content = getattr(message, 'content', None) if message is not None else None
+    # Capture reasoning_content if present (e.g., DeepSeek reasoner models)
+    reasoning_content = getattr(message, 'reasoning_content', None) if message is not None else None
     usage = response.usage
-    cached_tokens = getattr(getattr(usage, 'prompt_tokens_details', None), 'cached_tokens', 0)
+    cached_tokens = getattr(getattr(usage, 'prompt_tokens_details', None), 'cached_tokens', 0) or 0
 
     cost = self._calculate_cost(response)
     token_usage = TokenUsage(
@@ -135,8 +187,8 @@ class OpenAIAgent(LLMAgent):
 
     # Convert response to dict for raw logging
     raw_response = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
-    
-    return content, token_usage, raw_response
+
+    return content, reasoning_content, token_usage, raw_response
 
   def _completions(self, messages: list[dict], **kwargs) -> LLMResponse:
     messages = self._preprocess_messages(messages)
@@ -146,10 +198,10 @@ class OpenAIAgent(LLMAgent):
       **self.generation_config,
       **kwargs,
     )
-    content, token_usage, raw_response = self._parse_response(response)
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
     self._update_usage(token_usage)
-    
-    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
 
   async def _async_completions(self, messages: list[dict], **kwargs) -> LLMResponse:
     messages = self._preprocess_messages(messages)
@@ -159,10 +211,10 @@ class OpenAIAgent(LLMAgent):
       **self.generation_config,
       **kwargs,
     )
-    content, token_usage, raw_response = self._parse_response(response)
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
     await self._update_usage_async(token_usage)
-    
-    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
 
 
 class GrokAgent(OpenAIAgent):
@@ -348,8 +400,8 @@ class AnthropicAgent(LLMAgent):
     
     # Convert response to dict for raw logging
     raw_response = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
-    
-    return content, token_usage, raw_response
+
+    return content, None, token_usage, raw_response
 
   def _completions(self, messages: list[dict]) -> str:
     system, messages = self._preprocess_messages(messages)
@@ -360,12 +412,12 @@ class AnthropicAgent(LLMAgent):
     }
     if system is not None:
       kwargs["system"] = system
-    
+
     response = self.client.messages.create(**kwargs)
-    content, token_usage, raw_response = self._parse_response(response)
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
     self._update_usage(token_usage)
-    
-    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
 
   async def _async_completions(self, messages: list[dict]) -> LLMResponse:
     system, messages = self._preprocess_messages(messages)
@@ -376,12 +428,12 @@ class AnthropicAgent(LLMAgent):
     }
     if system is not None:
       kwargs["system"] = system
-    
+
     response = await self.async_client.messages.create(**kwargs)
-    content, token_usage, raw_response = self._parse_response(response)
+    content, reasoning_content, token_usage, raw_response = self._parse_response(response)
     await self._update_usage_async(token_usage)
-    
-    return LLMResponse(content=content, token_usage=token_usage, raw=raw_response)
+
+    return LLMResponse(content=content, reasoning_content=reasoning_content, token_usage=token_usage, raw=raw_response)
 
 class OpenRouterAgent(OpenAIAgent):
   def __init__(self, model: str,
