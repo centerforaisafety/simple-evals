@@ -14,6 +14,7 @@ Simple evaluation scripts for AI benchmarks with minimal dependencies.
   - [ERQA (Embodied Reasoning QA)](#erqa-embodied-reasoning-qa)
   - [IntPhys2](#intphys2)
   - [MindCube](#mindcube)
+  - [EnigmaEval](#enigmaeval)
   - [VCT-Refusal](#vct-refusal)
   - [MASK](#mask)
   - [Machiavelli](#machiavelli)
@@ -68,6 +69,7 @@ leaderboard_eval/
 ├── erqa/                    # ERQA benchmark
 ├── intphys2/                # IntPhys2 benchmark
 ├── mindcube/                # MindCube benchmark
+├── enigmaeval/              # EnigmaEval benchmark
 ├── vct_refusal/             # VCT-Refusal benchmark
 ├── mask/                    # MASK benchmark
 ├── machiavelli_eval/        # Machiavelli benchmark
@@ -424,6 +426,55 @@ python -m mindcube.mindcube_eval \
   archivePrefix={arXiv},
   primaryClass={cs.AI},
   url={https://arxiv.org/abs/2506.21458}
+}
+```
+
+</details>
+
+---
+
+### EnigmaEval
+
+[Paper](https://arxiv.org/abs/2502.08859) | [Dataset](https://huggingface.co/datasets/cais/EnigmaEval) | [Leaderboard](https://dashboard.safe.ai)
+
+Long multimodal puzzle-hunt challenges that take groups of people many hours or days to solve. The answer to every puzzle is a word or short phrase; the model writes a step-by-step solution and gives its final answer inside `<answer>...</answer>`, which is compared to the gold answer case-insensitively after whitespace/punctuation normalization.
+
+**Metrics:** Accuracy (exact match after normalization), overall and by subset (`--split normal` / `--split hard`)
+
+**Note:** `cais/EnigmaEval` is a gated dataset. Accept the conditions on the Hub, then set `HF_TOKEN` in `.env`. Puzzles are long multi-step reasoning tasks — give models a generous max-output-token budget, since truncated/empty completions silently score 0.
+
+**Arguments:**
+- `--model`: Model to evaluate (required)
+- `--output_dir`: Output directory (required)
+- `--models_config`: Path to models config (default: `configs/models.yaml`)
+- `--split`: `all` (default, 1161 puzzles), `normal`, or `hard`
+- `--max_concurrent`: Max concurrent requests (default: `32`)
+- `--num_puzzles`: Limit to the first N (shuffled) puzzles (optional)
+- `--exclude_meta`: Drop metapuzzles that require `prev_answers` (optional)
+- `--redo`: `True` for a fresh run, `False` to resume (default: `True`)
+
+**Example:**
+
+```bash
+python -m enigmaeval.enigmaeval_eval \
+  --model gpt-5-mini \
+  --output_dir results/enigmaeval/gpt-5-mini \
+  --split all \
+  --max_concurrent 32
+```
+
+<details>
+<summary>Citation</summary>
+
+```bibtex
+@misc{wang2025enigmaevalbenchmarklongmultimodal,
+  title={EnigmaEval: A Benchmark of Long Multimodal Reasoning Challenges},
+  author={Clinton J. Wang and Dean Lee and Cristina Menghini and Johannes Mols and Jack Doughty and Adam Khoja and Jayson Lynch and Sean Hendryx and Summer Yue and Dan Hendrycks},
+  year={2025},
+  eprint={2502.08859},
+  archivePrefix={arXiv},
+  primaryClass={cs.AI},
+  url={https://arxiv.org/abs/2502.08859}
 }
 ```
 
